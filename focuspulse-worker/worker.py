@@ -19,7 +19,7 @@ groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 def process_queue():
-    print("Worker listening for queue events...")
+    print("Worker listening for queue events...", flush=True)
     while True:
         try:
             res = requests.get(
@@ -31,12 +31,21 @@ def process_queue():
                 time.sleep(2)
                 continue
 
+            # Parse payload safely (handles potential double JSON stringification)
             item = json.loads(res["result"])
-            raw_text = item["text"]
-            chat_id = item["chat_id"]
+            if isinstance(item, str):
+                item = json.loads(item)
 
+            raw_text = item.get("text", "")
+            chat_id = item.get("chat_id")
+
+            if not raw_text or not chat_id:
+                print(f"Skipping invalid queue item: {item}", flush=True)
+                continue
+
+            # Call Groq AI using active llama3-8b-8192 model
             completion = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama3-8b-8192",
                 response_format={"type": "json_object"},
                 messages=[{
                     "role": "system",
@@ -51,19 +60,21 @@ def process_queue():
             
             parsed = json.loads(completion.choices[0].message.content)
 
+            # Insert into Supabase
             supabase.table("focus_logs").insert({
                 "telegram_user_id": chat_id,
                 "raw_message": raw_text,
-                "category": parsed["category"],
+                "category": parsed.get("category", "DEEP_WORK"),
                 "focus_minutes": parsed.get("focus_minutes", 0),
                 "distraction_minutes": parsed.get("distraction_minutes", 0),
                 "friction_flag": parsed.get("friction_flag", False),
                 "friction_reason": parsed.get("friction_reason")
             }).execute()
 
+            # Send Telegram Reply
             ack_msg = (
                 f"⚡ *Logged to CloudPulse*\n"
-                f"• Category: `{parsed['category']}`\n"
+                f"• Category: `{parsed.get('category', 'N/A')}`\n"
                 f"• Focus: `{parsed.get('focus_minutes', 0)} mins`\n"
                 f"• Distraction: `{parsed.get('distraction_minutes', 0)} mins`"
             )
@@ -72,9 +83,10 @@ def process_queue():
                 f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage", 
                 json={"chat_id": chat_id, "text": ack_msg, "parse_mode": "Markdown"}
             )
+            print(f"Successfully processed message for chat_id {chat_id}", flush=True)
 
         except Exception as e:
-            print(f"Error in execution loop: {e}")
+            print(f"Error in execution loop: {e}", flush=True)
             time.sleep(2)
 
 if __name__ == "__main__":
@@ -82,6 +94,6 @@ if __name__ == "__main__":
     worker_thread = threading.Thread(target=process_queue, daemon=True)
     worker_thread.start()
     
-    # Run Flask server on port provided by Render (defaults to 10000)
+    # Run Flask server on port provided by Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
